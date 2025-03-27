@@ -1,14 +1,20 @@
 const mongoose = require('mongoose');
 const { Pool } = require('pg');
-const path = require('path'); // Import path module
-require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // Specify path to .env
+// const path = require('path'); // Import path module - Not needed when relying on Docker Compose env vars
+// require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // Specify path to .env - Docker Compose injects env vars
 
 // MongoDB Connection
 const connectMongoDB = async () => {
+  // Ensure MONGO_URI is provided by the environment (Docker Compose)
+  if (!process.env.MONGO_URI) {
+    console.error('Error: MONGO_URI environment variable is not set.');
+    process.exit(1);
+  }
   try {
-    const conn = await mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/real-estate-app', {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
+    // Connect using the environment variable ONLY. No fallback to localhost.
+    const conn = await mongoose.connect(process.env.MONGO_URI, {
+      useNewUrlParser: true, // Deprecated, but included for compatibility if needed
+      useUnifiedTopology: true, // Deprecated, but included for compatibility if needed
     });
     console.log(`MongoDB Connected: ${conn.connection.host}`);
     return conn;

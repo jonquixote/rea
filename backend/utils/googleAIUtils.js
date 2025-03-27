@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // Initialize the Google Generative AI client
 const initializeAI = (apiKey) => {
@@ -237,7 +237,7 @@ const generateCashFlowImprovements = async (apiKey, propertyData, financialData)
   }
 };
 
-export {
+module.exports = {
   initializeAI,
   generatePropertyInsights,
   generateRentalEstimate,

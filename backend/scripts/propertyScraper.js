@@ -1,87 +1,156 @@
-// Property Scraper Implementation using Crawl4AI
+// Property Scraper Implementation using Crawl4AI via separate service
 const axios = require('axios');
-const { getRandomDelay, getRandomUserAgent, cleanPropertyData } = require('../utils/scraperUtils');
+const { cleanPropertyData } = require('../utils/scraperUtils'); // Removed unused delay/user-agent utils
 const { Property } = require('../models/mongoSchemas');
 const { pgPool } = require('../config/db');
-const dotenv = require('dotenv');
+// const dotenv = require('dotenv'); // Remove: Docker Compose injects env vars
 
-// Load environment variables
-dotenv.config();
+// dotenv.config({ path: require('path').resolve(__dirname, '../../.env') }); // Remove: Incorrect path and redundant
+
+// Get URL from environment variable set by Docker Compose
+const CRAWL4AI_SERVICE_URL = process.env.CRAWL4AI_SERVICE_URL; 
+
+// Add a check to ensure the variable is set
+if (!CRAWL4AI_SERVICE_URL) {
+  console.error("Error: CRAWL4AI_SERVICE_URL environment variable is not set. Check docker-compose.yml.");
+  process.exit(1); // Exit if the URL is missing
+}
 
 /**
  * Property Scraper Class
  */
 class PropertyScraper {
   constructor() {
-    this.userAgent = process.env.SCRAPER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-    this.minDelay = parseInt(process.env.SCRAPER_DELAY_MIN || '1000', 10);
-    this.maxDelay = parseInt(process.env.SCRAPER_DELAY_MAX || '5000', 10);
-    this.useProxy = process.env.USE_PROXY === 'true';
-    this.proxyList = process.env.PROXY_LIST ? process.env.PROXY_LIST.split(',') : [];
+    // Removed old properties like userAgent, delay, proxy as Crawl4AI service handles this
+    this.crawl4aiServiceUrl = CRAWL4AI_SERVICE_URL;
   }
 
   /**
-   * Get a random proxy from the list
-   * @returns {string|null} - Random proxy or null if none available
+   * Call the Crawl4AI service to scrape data.
+   * @param {string} url - The URL to scrape.
+   * @param {string} prompt - The prompt for data extraction.
+   * @returns {Promise<Object>} - The extracted data.
+   * @throws {Error} If scraping fails or the service returns an error.
    */
-  getRandomProxy() {
-    if (!this.useProxy || this.proxyList.length === 0) return null;
-    return this.proxyList[Math.floor(Math.random() * this.proxyList.length)];
-  }
-
-  /**
-   * Scrape property listings from a given URL
-   * @param {string} url - URL to scrape
-   * @param {Object} filters - Search filters
-   * @returns {Promise<Array>} - Array of property data
-   */
-  async scrapeListings(url, filters = {}) {
-    console.log(`Scraping property listings from: ${url}`);
-    console.log('Filters:', filters);
-
+  async callCrawl4aiService(url, prompt) {
+    const targetUrl = `${this.crawl4aiServiceUrl}/scrape`; // Construct URL
+    console.log(`Attempting to call Crawl4AI service at: ${targetUrl}`); // Log the URL
     try {
-      // In a real implementation, this would use Crawl4AI to scrape the website
-      // For now, we'll simulate the scraping process with a delay
-      
-      const delay = getRandomDelay(this.minDelay, this.maxDelay);
-      console.log(`Waiting for ${delay}ms before scraping...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      
-      // Simulate scraping results
-      const mockListings = this.generateMockListings(filters);
-      
-      console.log(`Scraped ${mockListings.length} property listings`);
-      return mockListings;
+      const response = await axios.post(targetUrl, { // Use the constructed URL
+        url,
+        prompt,
+      });
+
+      if (response.data && response.data.success && response.data.data) {
+        return response.data.data;
+      } else {
+        const errorMessage = response.data?.error || 'Unknown error from Crawl4AI service';
+        throw new Error(`Crawl4AI service failed: ${errorMessage}`);
+      }
     } catch (error) {
-      console.error(`Error scraping property listings: ${error.message}`);
-      throw error;
+      const errorMessage = error.response?.data?.detail || error.message;
+      console.error(`Error calling Crawl4AI service for ${url}: ${errorMessage}`);
+      throw new Error(`Failed to scrape ${url}: ${errorMessage}`);
     }
   }
+
+
+  /**
+   * Scrape property listings from a given URL/source configuration
+   * @param {string} sourceConfig - Object containing url, filters, and potentially listing prompt
+   * @returns {Promise<Array>} - Array of property listing data (e.g., [{ url: '...', price: '...', address: '...' }])
+   */
+  async scrapeListings(sourceConfig) {
+    const { url, filters = {}, listingPrompt } = sourceConfig;
+    console.log(`Scraping property listings from: ${url}`);
+    console.log('Filters:', filters); // Note: Filters are not directly used in scrape call, but might inform the prompt
+
+    // Define a generic prompt or use one from sourceConfig
+    const prompt = listingPrompt || `
+      Scrape this page listing multiple real estate properties for sale.
+      Extract the following information for each property listed:
+      - The direct URL to the property's detail page (as 'url')
+      - The listed price (as 'price')
+      - The full street address (as 'address')
+      - Number of bedrooms (as 'bedrooms')
+      - Number of bathrooms (as 'bathrooms')
+      - Square footage (as 'squareFootage')
+      Return the result as a JSON list of objects, where each object represents a property.
+      Example: [{"url": "...", "price": "$500,000", "address": "123 Main St", "bedrooms": 3, "bathrooms": 2, "squareFootage": 1500}, ...]
+    `;
+
+    try {
+      const extractedData = await this.callCrawl4aiService(url, prompt);
+
+      // Validate the structure of the returned data (should be a list)
+      if (!Array.isArray(extractedData)) {
+          console.error("Crawl4AI service did not return a list for listings:", extractedData);
+          throw new Error("Expected a list of listings from Crawl4AI service, but received a different type.");
+      }
+
+      console.log(`Scraped ${extractedData.length} potential property listings from ${url}`);
+      // Further validation could be added here to check if objects have expected keys (url, price, etc.)
+      return extractedData;
+
+    } catch (error) {
+        console.error(`Error scraping property listings from ${url}: ${error.message}`);
+        // Decide how to handle errors - skip source, retry, etc. Here we re-throw.
+        throw error;
+    }
+  }
+
 
   /**
    * Scrape detailed property data from a listing URL
    * @param {string} url - Property listing URL
+   * @param {string} detailPrompt - Optional prompt specific to detail scraping
    * @returns {Promise<Object>} - Detailed property data
    */
-  async scrapePropertyDetails(url) {
+  async scrapePropertyDetails(url, detailPrompt) {
     console.log(`Scraping property details from: ${url}`);
 
+    // Define a generic prompt or use the one provided
+    const prompt = detailPrompt || `
+      Scrape this real estate property detail page.
+      Extract the following information:
+      - Full street address (as 'address')
+      - City (as 'city')
+      - State (as 'state')
+      - Zip code (as 'zip')
+      - Listed price (as 'price')
+      - Number of bedrooms (as 'bedrooms')
+      - Number of bathrooms (as 'bathrooms')
+      - Square footage (as 'squareFootage')
+      - Year built (as 'yearBuilt')
+      - Lot size (as 'lotSize')
+      - Property type (e.g., 'Single Family', 'Condo') (as 'propertyType')
+      - HOA fees (if available, per month or year) (as 'hoaFees')
+      - Property tax information (if available) (as 'taxInfo')
+      - A detailed description of the property (as 'description')
+      - List of image URLs (as 'images', should be a list of strings)
+      - List of property features or amenities (as 'features', should be a list of strings)
+      - The source website or MLS name (as 'source')
+      Return the result as a single JSON object.
+      Example: {"address": "123 Main St", "city": "Anytown", "state": "CA", "zip": "12345", "price": "$500,000", ...}
+    `;
+
     try {
-      // In a real implementation, this would use Crawl4AI to scrape the property details
-      // For now, we'll simulate the scraping process with a delay
-      
-      const delay = getRandomDelay(this.minDelay, this.maxDelay);
-      console.log(`Waiting for ${delay}ms before scraping...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      
-      // Simulate property details
-      const mockDetails = this.generateMockPropertyDetails(url);
-      
-      console.log(`Scraped details for property: ${mockDetails.address}`);
-      return mockDetails;
+        const extractedData = await this.callCrawl4aiService(url, prompt);
+
+        // Basic validation (ensure it's an object)
+        if (typeof extractedData !== 'object' || extractedData === null || Array.isArray(extractedData)) {
+            console.error("Crawl4AI service did not return an object for details:", extractedData);
+            throw new Error("Expected an object with property details from Crawl4AI service.");
+        }
+
+        console.log(`Scraped details for property at: ${extractedData.address || url}`);
+        // Add the URL scraped from, as it might not be in the extracted data
+        extractedData.scrapedUrl = url;
+        return extractedData;
+
     } catch (error) {
-      console.error(`Error scraping property details: ${error.message}`);
-      throw error;
+        console.error(`Error scraping property details from ${url}: ${error.message}`);
+        throw error;
     }
   }
 
@@ -178,75 +247,7 @@ class PropertyScraper {
     }
   }
 
-  /**
-   * Generate mock property listings for testing
-   * @param {Object} filters - Search filters
-   * @returns {Array} - Array of mock property listings
-   */
-  generateMockListings(filters = {}) {
-    const count = Math.floor(Math.random() * 10) + 5; // 5-15 listings
-    const listings = [];
-    
-    for (let i = 0; i < count; i++) {
-      listings.push({
-        id: `property-${i + 1}`,
-        address: `${1000 + i} Main St`,
-        city: filters.city || 'Anytown',
-        state: filters.state || 'CA',
-        zip: filters.zip || '12345',
-        price: filters.minPrice ? 
-          Math.floor(Math.random() * (filters.maxPrice - filters.minPrice) + filters.minPrice) : 
-          Math.floor(Math.random() * 500000) + 200000,
-        bedrooms: filters.bedrooms || Math.floor(Math.random() * 3) + 2,
-        bathrooms: filters.bathrooms || Math.floor(Math.random() * 2) + 1.5,
-        squareFootage: Math.floor(Math.random() * 1000) + 1000,
-        url: `https://example.com/property-${i + 1}`
-      });
-    }
-    
-    return listings;
-  }
-
-  /**
-   * Generate mock property details for testing
-   * @param {string} url - Property URL
-   * @returns {Object} - Mock property details
-   */
-  generateMockPropertyDetails(url) {
-    const propertyId = url.split('-').pop();
-    
-    return {
-      id: `property-${propertyId}`,
-      address: `${1000 + parseInt(propertyId, 10)} Main St`,
-      city: 'Anytown',
-      state: 'CA',
-      zip: '12345',
-      price: Math.floor(Math.random() * 500000) + 200000,
-      bedrooms: Math.floor(Math.random() * 3) + 2,
-      bathrooms: Math.floor(Math.random() * 2) + 1.5,
-      squareFootage: Math.floor(Math.random() * 1000) + 1000,
-      yearBuilt: Math.floor(Math.random() * 50) + 1970,
-      lotSize: Math.floor(Math.random() * 5000) + 5000,
-      propertyType: 'Single Family',
-      hoaFees: Math.random() < 0.3 ? Math.floor(Math.random() * 300) + 100 : 0,
-      taxInfo: Math.floor(Math.random() * 5000) + 2000,
-      description: 'Beautiful home in a great neighborhood with excellent schools and amenities.',
-      images: [
-        { url: 'https://example.com/images/property-1.jpg', caption: 'Front view', isPrimary: true },
-        { url: 'https://example.com/images/property-2.jpg', caption: 'Kitchen', isPrimary: false },
-        { url: 'https://example.com/images/property-3.jpg', caption: 'Living room', isPrimary: false }
-      ],
-      features: [
-        'Central Air',
-        'Hardwood Floors',
-        'Granite Countertops',
-        'Stainless Steel Appliances',
-        'Fenced Yard'
-      ],
-      source: 'Mock MLS',
-      detailedDescription: 'This stunning home features an open floor plan with plenty of natural light. The kitchen has been recently updated with granite countertops and stainless steel appliances. The spacious master bedroom includes an en-suite bathroom with a double vanity and walk-in shower. The backyard is perfect for entertaining with a covered patio and mature landscaping.'
-    };
-  }
-}
+  // Removed generateMockListings and generateMockPropertyDetails as they are replaced by actual scraping
+} // End of PropertyScraper class
 
 module.exports = PropertyScraper;

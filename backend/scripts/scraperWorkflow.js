@@ -3,11 +3,11 @@ const PropertyScraper = require('./propertyScraper');
 const RentalEstimatorScraper = require('./rentalScraper');
 const { ScrapingJob } = require('../models/mongoSchemas');
 const { calculateRentToPriceRatio, calculateSqftToPriceRatio, calculateMonthlyExpenses, calculateCashFlow } = require('../utils/metricsUtils');
-const { pgPool } = require('../config/db');
-const dotenv = require('dotenv');
+const { pgPool, connectMongoDB } = require('../config/db'); // Import connectMongoDB
+// const dotenv = require('dotenv'); // Redundant in Docker context
 
-// Load environment variables
-dotenv.config();
+// Load environment variables - Redundant in Docker context
+// dotenv.config();
 
 /**
  * Scraper Workflow Manager Class
@@ -30,6 +30,9 @@ class ScraperWorkflowManager {
     console.log(`Starting property scraping job from ${source}`);
     
     try {
+      // Ensure MongoDB is connected for this script execution
+      await connectMongoDB(); 
+      
       // Create scraping job record
       const scrapingJob = new ScrapingJob({
         jobType: 'property',
@@ -43,7 +46,7 @@ class ScraperWorkflowManager {
       await scrapingJob.save();
       
       // Scrape property listings
-      const listings = await this.propertyScraper.scrapeListings(url, filters);
+      const listings = await this.propertyScraper.scrapeListings({ url, filters }); // Pass args as single object
       
       // Initialize results
       let processedItems = 0;
@@ -129,6 +132,9 @@ class ScraperWorkflowManager {
     console.log(`Starting rental scraping job from ${source}`);
     
     try {
+      // Ensure MongoDB is connected for this script execution
+      await connectMongoDB(); 
+
       // Create scraping job record
       const scrapingJob = new ScrapingJob({
         jobType: 'rental',
@@ -142,7 +148,7 @@ class ScraperWorkflowManager {
       await scrapingJob.save();
       
       // Scrape rental listings
-      const listings = await this.rentalScraper.scrapeRentalListings(url, filters);
+      const listings = await this.rentalScraper.scrapeRentalListings({ url, filters }); // Pass args as single object
       
       // Initialize results
       let processedItems = 0;

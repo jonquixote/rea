@@ -1,87 +1,155 @@
-// Rental Estimator Scraper Implementation
+// Rental Estimator Scraper Implementation using Crawl4AI via separate service
 const axios = require('axios');
-const { getRandomDelay, getRandomUserAgent } = require('../utils/scraperUtils');
+// Removed unused delay/user-agent utils from scraperUtils
 const { RentalTrainingData } = require('../models/mongoSchemas');
 const { pgPool } = require('../config/db');
-const dotenv = require('dotenv');
+// const dotenv = require('dotenv'); // Remove: Docker Compose injects env vars
 
-// Load environment variables
-dotenv.config();
+// Load environment variables from root - Remove: Incorrect path and redundant
+// dotenv.config({ path: require('path').resolve(__dirname, '../../.env') });
+
+// Get URL from environment variable set by Docker Compose
+const CRAWL4AI_SERVICE_URL = process.env.CRAWL4AI_SERVICE_URL;
+
+// Add a check to ensure the variable is set
+if (!CRAWL4AI_SERVICE_URL) {
+  console.error("Error: CRAWL4AI_SERVICE_URL environment variable is not set. Check docker-compose.yml.");
+  process.exit(1); // Exit if the URL is missing
+}
 
 /**
  * Rental Estimator Scraper Class
  */
 class RentalEstimatorScraper {
   constructor() {
-    this.userAgent = process.env.SCRAPER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
-    this.minDelay = parseInt(process.env.SCRAPER_DELAY_MIN || '1000', 10);
-    this.maxDelay = parseInt(process.env.SCRAPER_DELAY_MAX || '5000', 10);
-    this.useProxy = process.env.USE_PROXY === 'true';
-    this.proxyList = process.env.PROXY_LIST ? process.env.PROXY_LIST.split(',') : [];
+    // Removed old properties like userAgent, delay, proxy
+    this.crawl4aiServiceUrl = CRAWL4AI_SERVICE_URL;
   }
 
   /**
-   * Get a random proxy from the list
-   * @returns {string|null} - Random proxy or null if none available
+   * Call the Crawl4AI service to scrape data.
+   * @param {string} url - The URL to scrape.
+   * @param {string} prompt - The prompt for data extraction.
+   * @returns {Promise<Object>} - The extracted data.
+   * @throws {Error} If scraping fails or the service returns an error.
    */
-  getRandomProxy() {
-    if (!this.useProxy || this.proxyList.length === 0) return null;
-    return this.proxyList[Math.floor(Math.random() * this.proxyList.length)];
+  async callCrawl4aiService(url, prompt) {
+    const targetUrl = `${this.crawl4aiServiceUrl}/scrape`; // Construct URL
+    console.log(`Attempting to call Crawl4AI service at: ${targetUrl}`); // Log the URL
+    try {
+      const response = await axios.post(targetUrl, { // Use the constructed URL
+        url,
+        prompt,
+      });
+
+      if (response.data && response.data.success && response.data.data) {
+        return response.data.data;
+      } else {
+        const errorMessage = response.data?.error || 'Unknown error from Crawl4AI service';
+        throw new Error(`Crawl4AI service failed: ${errorMessage}`);
+      }
+    } catch (error) {
+      const errorMessage = error.response?.data?.detail || error.message;
+      console.error(`Error calling Crawl4AI service for ${url}: ${errorMessage}`);
+      throw new Error(`Failed to scrape ${url}: ${errorMessage}`);
+    }
   }
 
   /**
-   * Scrape rental listings from a given URL
-   * @param {string} url - URL to scrape
-   * @param {Object} filters - Search filters
-   * @returns {Promise<Array>} - Array of rental data
+   * Scrape rental listings from a given URL/source configuration
+   * @param {string} sourceConfig - Object containing url, filters, and potentially listing prompt
+   * @returns {Promise<Array>} - Array of rental listing data (e.g., [{ url: '...', rent: '...', address: '...' }])
    */
-  async scrapeRentalListings(url, filters = {}) {
+  async scrapeRentalListings(sourceConfig) {
+    const { url, filters = {}, listingPrompt } = sourceConfig;
     console.log(`Scraping rental listings from: ${url}`);
-    console.log('Filters:', filters);
+    console.log('Filters:', filters); // Filters might inform the prompt
+
+    // Define a generic prompt or use one from sourceConfig
+    const prompt = listingPrompt || `
+      Scrape this page listing multiple real estate properties for rent.
+      Extract the following information for each property listed:
+      - The direct URL to the rental's detail page (as 'url')
+      - The listed monthly rent (as 'rent')
+      - The full street address (as 'address')
+      - Number of bedrooms (as 'bedrooms')
+      - Number of bathrooms (as 'bathrooms')
+      - Square footage (if available) (as 'squareFootage')
+      Return the result as a JSON list of objects, where each object represents a rental property.
+      Example: [{"url": "...", "rent": "$2,500/mo", "address": "456 Oak St", "bedrooms": 2, "bathrooms": 1, "squareFootage": 900}, ...]
+    `;
 
     try {
-      // In a real implementation, this would use Crawl4AI to scrape the website
-      // For now, we'll simulate the scraping process with a delay
-      
-      const delay = getRandomDelay(this.minDelay, this.maxDelay);
-      console.log(`Waiting for ${delay}ms before scraping...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      
-      // Simulate scraping results
-      const mockRentals = this.generateMockRentalListings(filters);
-      
-      console.log(`Scraped ${mockRentals.length} rental listings`);
-      return mockRentals;
+      const extractedData = await this.callCrawl4aiService(url, prompt);
+
+      // Validate the structure (should be a list)
+      if (!Array.isArray(extractedData)) {
+          console.error("Crawl4AI service did not return a list for rental listings:", extractedData);
+          throw new Error("Expected a list of rental listings from Crawl4AI service.");
+      }
+
+      console.log(`Scraped ${extractedData.length} potential rental listings from ${url}`);
+      return extractedData;
+
     } catch (error) {
-      console.error(`Error scraping rental listings: ${error.message}`);
-      throw error;
+        console.error(`Error scraping rental listings from ${url}: ${error.message}`);
+        throw error;
     }
   }
 
   /**
    * Scrape detailed rental data from a listing URL
    * @param {string} url - Rental listing URL
+   * @param {string} detailPrompt - Optional prompt specific to detail scraping
    * @returns {Promise<Object>} - Detailed rental data
    */
-  async scrapeRentalDetails(url) {
+  async scrapeRentalDetails(url, detailPrompt) {
     console.log(`Scraping rental details from: ${url}`);
 
+    // Define a generic prompt or use the one provided
+    const prompt = detailPrompt || `
+      Scrape this real estate rental property detail page.
+      Extract the following information:
+      - Full street address (as 'address')
+      - City (as 'city')
+      - State (as 'state')
+      - Zip code (as 'zip')
+      - Listed monthly rent (as 'rent')
+      - Number of bedrooms (as 'bedrooms')
+      - Number of bathrooms (as 'bathrooms')
+      - Square footage (as 'squareFootage')
+      - Property type (e.g., 'Apartment', 'House', 'Condo') (as 'propertyType')
+      - Year built (if available) (as 'yearBuilt')
+      - List of amenities or features (as 'features', should be a list of strings)
+      - Date the listing was posted or became available (if available) (as 'listingDate')
+      - The source website or listing provider name (as 'source')
+      - A detailed description of the rental property (as 'description')
+      Return the result as a single JSON object.
+      Example: {"address": "456 Oak St", "city": "Anytown", "state": "CA", "zip": "12345", "rent": "$2,500/mo", ...}
+    `;
+
     try {
-      // In a real implementation, this would use Crawl4AI to scrape the rental details
-      // For now, we'll simulate the scraping process with a delay
-      
-      const delay = getRandomDelay(this.minDelay, this.maxDelay);
-      console.log(`Waiting for ${delay}ms before scraping...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      
-      // Simulate rental details
-      const mockDetails = this.generateMockRentalDetails(url);
-      
-      console.log(`Scraped details for rental: ${mockDetails.address}`);
-      return mockDetails;
+        const extractedData = await this.callCrawl4aiService(url, prompt);
+
+        // Basic validation (ensure it's an object)
+        if (typeof extractedData !== 'object' || extractedData === null || Array.isArray(extractedData)) {
+            console.error("Crawl4AI service did not return an object for rental details:", extractedData);
+            throw new Error("Expected an object with rental details from Crawl4AI service.");
+        }
+
+        console.log(`Scraped details for rental at: ${extractedData.address || url}`);
+        // Add the URL scraped from
+        extractedData.scrapedUrl = url;
+        // Rename 'rent' to 'actualRent' to match schema? Or handle in saveRentalData
+        if (extractedData.rent) {
+            extractedData.actualRent = extractedData.rent;
+            // delete extractedData.rent; // Optional: remove original 'rent' key
+        }
+        return extractedData;
+
     } catch (error) {
-      console.error(`Error scraping rental details: ${error.message}`);
-      throw error;
+        console.error(`Error scraping rental details from ${url}: ${error.message}`);
+        throw error;
     }
   }
 
@@ -191,85 +259,7 @@ class RentalEstimatorScraper {
     }
   }
 
-  /**
-   * Generate mock rental listings for testing
-   * @param {Object} filters - Search filters
-   * @returns {Array} - Array of mock rental listings
-   */
-  generateMockRentalListings(filters = {}) {
-    const count = Math.floor(Math.random() * 10) + 5; // 5-15 listings
-    const listings = [];
-    
-    for (let i = 0; i < count; i++) {
-      const bedrooms = filters.bedrooms || Math.floor(Math.random() * 3) + 1;
-      const bathrooms = filters.bathrooms || Math.floor(Math.random() * 2) + 1;
-      const squareFootage = Math.floor(Math.random() * 800) + 700;
-      
-      // Calculate rent based on bedrooms and location
-      let baseRent = 1000;
-      if (filters.city === 'San Francisco' || filters.city === 'New York') {
-        baseRent = 2500;
-      } else if (filters.city === 'Chicago' || filters.city === 'Los Angeles') {
-        baseRent = 1800;
-      }
-      
-      const rent = baseRent + (bedrooms * 500) + (bathrooms * 300) + (squareFootage * 0.5);
-      
-      listings.push({
-        id: `rental-${i + 1}`,
-        address: `${2000 + i} Oak St`,
-        city: filters.city || 'Anytown',
-        state: filters.state || 'CA',
-        zip: filters.zip || '12345',
-        rent: Math.floor(rent),
-        bedrooms,
-        bathrooms,
-        squareFootage,
-        url: `https://example.com/rental-${i + 1}`
-      });
-    }
-    
-    return listings;
-  }
-
-  /**
-   * Generate mock rental details for testing
-   * @param {string} url - Rental URL
-   * @returns {Object} - Mock rental details
-   */
-  generateMockRentalDetails(url) {
-    const rentalId = url.split('-').pop();
-    const bedrooms = Math.floor(Math.random() * 3) + 1;
-    const bathrooms = Math.floor(Math.random() * 2) + 1;
-    const squareFootage = Math.floor(Math.random() * 800) + 700;
-    
-    // Calculate rent based on bedrooms
-    const rent = 1000 + (bedrooms * 500) + (bathrooms * 300) + (squareFootage * 0.5);
-    
-    return {
-      id: `rental-${rentalId}`,
-      address: `${2000 + parseInt(rentalId, 10)} Oak St`,
-      city: 'Anytown',
-      state: 'CA',
-      zip: '12345',
-      rent: Math.floor(rent),
-      bedrooms,
-      bathrooms,
-      squareFootage,
-      yearBuilt: Math.floor(Math.random() * 40) + 1980,
-      propertyType: Math.random() < 0.7 ? 'Apartment' : 'Condo',
-      features: [
-        'In-unit Laundry',
-        'Dishwasher',
-        'Air Conditioning',
-        Math.random() < 0.5 ? 'Balcony' : 'Patio',
-        Math.random() < 0.3 ? 'Pool' : 'Fitness Center'
-      ],
-      listingDate: new Date(),
-      source: 'Mock Rental Site',
-      description: 'Spacious apartment with modern amenities in a convenient location. Close to shopping, dining, and public transportation.'
-    };
-  }
-}
+  // Removed generateMockRentalListings and generateMockRentalDetails
+} // End of RentalEstimatorScraper class
 
 module.exports = RentalEstimatorScraper;

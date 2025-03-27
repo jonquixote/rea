@@ -1,0 +1,77 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: real-estate-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # Expose backend port 8000 to host
+    environment:
+      # Use service names as hostnames for DB connections within Docker network
+      MONGO_URI: mongodb://mongo:27017/real-estate-app
+      POSTGRES_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Add any other backend-specific env vars here
+      # NODE_ENV: development
+      CRAWL4AI_SERVICE_URL: http://crawl4ai:8001 # URL for the Python service
+    volumes:
+      - .:/usr/src/app # Mount current directory to container for development (optional)
+      - /usr/src/app/node_modules # Don't mount node_modules from host
+    depends_on:
+      - postgres
+      - mongo
+      - crawl4ai
+    networks:
+      - real-estate-net
+
+  crawl4ai:
+    build:
+      context: ./crawl4ai-service
+      dockerfile: Dockerfile
+    container_name: real-estate-crawl4ai
+    restart: unless-stopped
+    ports:
+      - "8001:8001" # Expose crawl4ai service port 8001 to host
+    environment:
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY} # Get key from .env file
+      # Add any other Python service env vars if needed
+    volumes:
+      - ./crawl4ai-service:/app # Mount for development (optional)
+    networks:
+      real-estate-net:
+        aliases:
+          - crawl4ai # Explicitly define alias (usually automatic)
+
+  postgres:
+    image: postgis/postgis:15-3.4 # Use PostGIS enabled image
+    container_name: real-estate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-real_estate_db}
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    ports:
+      - "5432:5432" # Expose PostgreSQL port 5432 to host
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - real-estate-net
+
+  mongo:
+    image: mongo:latest
+    container_name: real-estate-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017" # Expose MongoDB port 27017 to host
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - real-estate-net
+
+volumes:
+  postgres_data:
+  mongo_data:
+
+networks:
+  real-estate-net:
+    driver: bridge

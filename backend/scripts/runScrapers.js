@@ -11,6 +11,12 @@ const scraperManager = new ScraperWorkflowManager();
 // Define sources and URLs for scraping
 const propertySources = [
   {
+    name: 'example-test', // Add a simple test case
+    url: 'https://example.com',
+    filters: {}, // No filters needed
+    listingPrompt: 'Extract the main heading (h1) text from this page as json like {"heading": "text"}' // Simple prompt
+  },
+  {
     name: 'zillow',
     url: 'https://www.zillow.com/homes/for_sale/',
     filters: {
