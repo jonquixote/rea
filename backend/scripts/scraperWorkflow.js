@@ -17,24 +17,46 @@ class ScraperWorkflowManager {
   constructor() {
     this.propertyScraper = new PropertyScraper();
     this.rentalScraper = new RentalEstimatorScraper();
+    // Base template for consistent structure, especially for list-based extractions
+    this.extractionTemplate = { 
+      items: [] 
+    };
+    // Define headers to be used
+    this.headers = {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Cache-Control': 'no-cache',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+    };
   }
 
   /**
    * Run a property scraping job
-   * @param {string} source - Source website (e.g., 'zillow', 'realtor')
+   * @param {string} source - Source website name (e.g., 'zillow', 'realtor')
    * @param {string} url - Base URL to scrape
    * @param {Object} filters - Search filters
-   * @returns {Promise<Object>} - Job results
+   * @param {string} listingPrompt - The specific prompt for extracting listings
+   * @returns {Promise<Object>} - Job results including success status and data/error
    */
-  async runPropertyScrapingJob(source, url, filters = {}) {
-    console.log(`Starting property scraping job from ${source}`);
-    
+  async runPropertyScrapingJob(source, url, filters = {}, listingPrompt) {
+    console.log(`[DEBUG] Starting extraction for ${source}`);
+    console.log(`[DEBUG] URL: ${url}`);
+    console.log(`[DEBUG] Prompt length: ${listingPrompt?.length || 0}`);
+    console.log(`[DEBUG] Using headers:`, this.headers); // Log headers being used
+
+    let scrapingJob; // Define scrapingJob here to access in finally block if needed
+
     try {
-      // Ensure MongoDB is connected for this script execution
-      await connectMongoDB(); 
-      
+      // Validate URL and prompt
+      if (!url || !listingPrompt) {
+        throw new Error('Missing required URL or prompt for property scraping job.');
+      }
+
+      // Ensure MongoDB is connected
+      await connectMongoDB();
+
       // Create scraping job record
-      const scrapingJob = new ScrapingJob({
+      scrapingJob = new ScrapingJob({
         jobType: 'property',
         status: 'in_progress',
         source,
@@ -42,84 +64,125 @@ class ScraperWorkflowManager {
         parameters: filters,
         startTime: new Date()
       });
-      
       await scrapingJob.save();
-      
-      // Scrape property listings
-      const listings = await this.propertyScraper.scrapeListings({ url, filters }); // Pass args as single object
-      
-      // Initialize results
+
+      // Enhance the prompt with structure hints
+      const enhancedPrompt = `
+INSTRUCTIONS:
+${listingPrompt}
+
+REQUIREMENTS:
+1. Return valid JSON only.
+2. The top-level structure MUST contain an "items" array, even if empty.
+3. Each object within the "items" array must have all the fields requested in the prompt (use null if a value cannot be found).
+4. Ensure no additional text, comments, or markdown formatting surrounds the JSON output.
+
+EXAMPLE OUTPUT (Structure):
+${JSON.stringify(this.extractionTemplate, null, 2)}
+      `;
+
+      // Scrape property listings using the enhanced prompt and headers
+      // Note: scrapeListings needs to accept 'headers' in its options object
+      const listingsData = await this.propertyScraper.scrapeListings({
+        source,
+        url,
+        filters,
+        listingPrompt: enhancedPrompt,
+        headers: this.headers // Pass headers here
+      });
+
+      console.log(`[DEBUG] Extraction result type: ${typeof listingsData}`);
+      console.log(`[DEBUG] Extraction result (raw):`, listingsData);
+
+      // Ensure the result has the expected structure (object with 'items' array)
+      let finalData = this.extractionTemplate; // Default to empty template
+      if (listingsData && typeof listingsData === 'object' && Array.isArray(listingsData.items)) {
+          finalData = listingsData;
+          console.log(`[DEBUG] Valid listing data structure received. Items count: ${finalData.items.length}`);
+      } else {
+          console.warn(`[DEBUG] Received unexpected data structure or null. Defaulting to empty template. Received:`, listingsData);
+      }
+
+      const listings = finalData.items; // Extract the array for processing
+
+      // Initialize results counters
       let processedItems = 0;
       let successItems = 0;
       let failedItems = 0;
-      
-      // Process each listing
+
+      // Process each listing (if any)
       for (const listing of listings) {
+        // Basic check for a URL before proceeding
+        if (!listing || !listing.url) {
+            console.warn(`[DEBUG] Skipping listing due to missing URL:`, listing);
+            failedItems++;
+            continue;
+        }
         try {
           processedItems++;
-          
-          // Scrape detailed property data
+          // Scrape detailed property data (assuming scrapePropertyDetails exists and works)
           const propertyDetails = await this.propertyScraper.scrapePropertyDetails(listing.url);
-          
-          // Save property data to database
+          // Save property data (assuming savePropertyData exists and works)
           const savedProperty = await this.propertyScraper.savePropertyData(propertyDetails);
-          
-          // Get rental estimate for this property
+          // Get rental estimate (assuming estimateRental exists and works)
           const rentalEstimate = await this.estimateRental(savedProperty);
-          
-          // Save rental estimate
+          // Save rental estimate (assuming saveRentalEstimate exists and works)
           await this.rentalScraper.saveRentalEstimate(
             savedProperty.pgPropertyId,
             rentalEstimate.estimatedRent,
             rentalEstimate.method,
             rentalEstimate.confidenceScore
           );
-          
-          // Calculate and save investment metrics
+          // Calculate and save metrics (assuming calculateAndSaveMetrics exists and works)
           await this.calculateAndSaveMetrics(savedProperty.pgPropertyId, savedProperty, rentalEstimate.estimatedRent);
-          
           successItems++;
         } catch (error) {
-          console.error(`Error processing property listing: ${error.message}`);
+          console.error(`[DEBUG] Error processing individual property listing (${listing.url}): ${error.message}`, error.stack);
           failedItems++;
         }
       }
-      
-      // Update job status
+
+      // Update job status to completed
       scrapingJob.status = 'completed';
       scrapingJob.results = {
-        totalItems: listings.length,
+        totalItems: listings.length, // Count items from the extracted array
         processedItems,
         successItems,
         failedItems
       };
       scrapingJob.endTime = new Date();
-      
       await scrapingJob.save();
-      
-      console.log(`Property scraping job completed: ${successItems} successful, ${failedItems} failed`);
-      
+
+      console.log(`Property scraping job completed: ${successItems} successful, ${failedItems} failed out of ${listings.length} potential listings.`);
+
+      // Return structure indicating overall job success and the extracted data
       return {
         jobId: scrapingJob._id,
         status: 'completed',
         results: scrapingJob.results
+        // Consider if returning 'finalData' itself is useful here
       };
+
     } catch (error) {
-      console.error(`Error running property scraping job: ${error.message}`);
-      
-      // Update job status on error
-      await ScrapingJob.findOneAndUpdate(
-        { jobType: 'property', source, url },
-        {
+      console.error(`[DEBUG] Critical error running property scraping job for ${source}: ${error.message}`, error.stack);
+      // Update job status to failed if the job record was created
+      if (scrapingJob && scrapingJob._id) {
+          await ScrapingJob.findByIdAndUpdate(scrapingJob._id, {
+              status: 'failed',
+              error: error.message,
+              endTime: new Date()
+          });
+      }
+      // Re-throw or return error structure
+      // throw error; // Option 1: Re-throw
+      return { // Option 2: Return error structure
+          jobId: scrapingJob ? scrapingJob._id : null,
           status: 'failed',
-          error: error.message,
-          endTime: new Date()
-        }
-      );
-      
-      throw error;
+          error: error.message
+      };
     }
   }
+
 
   /**
    * Run a rental scraping job

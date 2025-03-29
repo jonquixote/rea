@@ -42,14 +42,19 @@ class RentalEstimatorScraper {
         prompt,
       });
 
-      if (response.data && response.data.success && response.data.data) {
+      // Check for success first
+      if (response.data && response.data.success) {
+        // Return the data, which might be null if nothing was extracted
         return response.data.data;
       } else {
-        const errorMessage = response.data?.error || 'Unknown error from Crawl4AI service';
+        // If success is false, or response format is unexpected, throw an error
+        const errorMessage = response.data?.error || 'Unknown error or invalid response from Crawl4AI service';
+        console.error(`Crawl4AI service indicated failure for ${url}: ${errorMessage}`); // Log the specific error from the service if available
         throw new Error(`Crawl4AI service failed: ${errorMessage}`);
       }
     } catch (error) {
-      const errorMessage = error.response?.data?.detail || error.message;
+       // Handle network errors or errors thrown explicitly above
+      const errorMessage = error.response?.data?.detail || error.message; // Prefer detail if available from FastAPI error
       console.error(`Error calling Crawl4AI service for ${url}: ${errorMessage}`);
       throw new Error(`Failed to scrape ${url}: ${errorMessage}`);
     }
@@ -67,27 +72,36 @@ class RentalEstimatorScraper {
 
     // Define a generic prompt or use one from sourceConfig
     const prompt = listingPrompt || `
-      Scrape this page listing multiple real estate properties for rent.
-      Extract the following information for each property listed:
-      - The direct URL to the rental's detail page (as 'url')
-      - The listed monthly rent (as 'rent')
-      - The full street address (as 'address')
-      - Number of bedrooms (as 'bedrooms')
-      - Number of bathrooms (as 'bathrooms')
-      - Square footage (if available) (as 'squareFootage')
-      Return the result as a JSON list of objects, where each object represents a rental property.
-      Example: [{"url": "...", "rent": "$2,500/mo", "address": "456 Oak St", "bedrooms": 2, "bathrooms": 1, "squareFootage": 900}, ...]
+      Analyze this real estate search results page which lists multiple properties for rent.
+      Identify the main list or grid containing the individual rental property summaries.
+      For EACH rental property summary found in that list, extract the following details:
+      - The direct URL link to the rental's own detail page (key: 'url').
+      - The listed monthly rent amount (key: 'rent'). If not found, use null.
+      - The full street address (key: 'address'). If not found, use null.
+      - Number of bedrooms (key: 'bedrooms'). If not found, use null.
+      - Number of bathrooms (key: 'bathrooms'). If not found, use null.
+      - Square footage (key: 'squareFootage'). If not found, use null.
+      Return ALL extracted rental properties as a single JSON list of objects. Each object in the list must represent one rental and contain the keys 'url', 'rent', 'address', 'bedrooms', 'bathrooms', and 'squareFootage'.
+      If no rental properties are found on the page, return an empty list [].
+      Example of expected output format: [{"url": "...", "rent": "$2,500/mo", "address": "456 Oak St", "bedrooms": 2, "bathrooms": 1, "squareFootage": 900}, {"url": "...", ...}]
     `;
 
     try {
       const extractedData = await this.callCrawl4aiService(url, prompt);
 
-      // Validate the structure (should be a list)
-      if (!Array.isArray(extractedData)) {
-          console.error("Crawl4AI service did not return a list for rental listings:", extractedData);
-          throw new Error("Expected a list of rental listings from Crawl4AI service.");
+      // If extractedData is null (meaning service succeeded but found nothing), return an empty array.
+      if (extractedData === null) {
+          console.log(`Crawl4AI service returned null (no rental listings found) for ${url}. Returning empty list.`);
+          return [];
       }
 
+      // If it's not null, validate that it's an array.
+      if (!Array.isArray(extractedData)) {
+          console.error("Crawl4AI service did not return a list or null for rental listings:", extractedData);
+          throw new Error("Expected a list of rental listings or null from Crawl4AI service, but received a different type.");
+      }
+
+      // If it's a valid array, log and return it.
       console.log(`Scraped ${extractedData.length} potential rental listings from ${url}`);
       return extractedData;
 

@@ -8,13 +8,63 @@ const { pgPool } = require('../config/db');
 // dotenv.config({ path: require('path').resolve(__dirname, '../../.env') }); // Remove: Incorrect path and redundant
 
 // Get URL from environment variable set by Docker Compose
-const CRAWL4AI_SERVICE_URL = process.env.CRAWL4AI_SERVICE_URL; 
+const CRAWL4AI_SERVICE_URL = process.env.CRAWL4AI_SERVICE_URL;
+const MAX_RETRIES = 3; // Number of retry attempts
+const RETRY_DELAY = 2000; // Delay between retries in milliseconds
 
 // Add a check to ensure the variable is set
 if (!CRAWL4AI_SERVICE_URL) {
   console.error("Error: CRAWL4AI_SERVICE_URL environment variable is not set. Check docker-compose.yml.");
   process.exit(1); // Exit if the URL is missing
 }
+
+// Define site-specific prompts for listing pages
+const SITE_SPECIFIC_LISTING_PROMPTS = {
+  zillow: `
+    Analyze this Zillow search results page. First, locate the main container holding the results, which is a 'div' with the id 'grid-search-results'.
+    Within this container, find all property card elements, which are 'article' tags with the attribute 'data-test="property-card"'.
+    For each 'article' element found:
+    - Extract the direct URL link to the property's detail page, likely from an 'a' tag within the article (key: 'url').
+    - Extract the price from the 'span' element with the attribute 'data-test="property-card-price"' (key: 'price').
+    - Extract the full street address, likely from an 'address' tag or similar within the article (key: 'address').
+    - Extract the number of bedrooms (e.g., "3 bds"), look for elements indicating beds within the article (key: 'bedrooms').
+    - Extract the number of bathrooms (e.g., "2 ba"), look for elements indicating baths within the article (key: 'bathrooms').
+    - Extract the square footage (e.g., "1,500 sqft"), look for elements indicating sqft within the article (key: 'squareFootage').
+    Return ALL extracted properties as a single JSON list of objects. Each object must have keys 'url', 'price', 'address', 'bedrooms', 'bathrooms', 'squareFootage'. Use null if a value isn't found for any key.
+    If no property cards ('article' with 'data-test="property-card"') are found, return an empty list [].
+  `,
+  realtor: `
+    Analyze this Realtor.com search results page. Locate the main container for property listings (e.g., div with data-testid="property-list" or similar).
+    Within this container, identify each individual property listing card.
+    For each listing card:
+    - Extract the direct URL link to the property's detail page (key: 'url').
+    - Extract the price, often found in an element with class containing "price" or "price-wrapper" (key: 'price').
+    - Extract the full street address, typically in an element with class containing "listing-address" or similar (key: 'address').
+    - Extract the number of bedrooms (key: 'bedrooms').
+    - Extract the number of bathrooms (key: 'bathrooms').
+    - Extract the square footage (key: 'squareFootage'). These details are often grouped in an element with class containing "property-meta" or "property-info".
+    Return ALL extracted properties as a single JSON list of objects. Each object must have keys 'url', 'price', 'address', 'bedrooms', 'bathrooms', 'squareFootage'. Use null if a value isn't found.
+    If no properties are found, return an empty list [].
+  `,
+  // Add other source-specific prompts here if needed
+};
+
+// Generic prompt as a fallback
+const GENERIC_LISTING_PROMPT = `
+  Analyze this real estate search results page which lists multiple properties for sale.
+  Identify the main list or grid containing the individual property summaries.
+  For EACH property summary found in that list, extract the following details:
+  - The direct URL link to the property's own detail page (key: 'url').
+  - The listed sale price (key: 'price'). If not found, use null.
+  - The full street address (key: 'address'). If not found, use null.
+  - Number of bedrooms (key: 'bedrooms'). If not found, use null.
+  - Number of bathrooms (key: 'bathrooms'). If not found, use null.
+  - Square footage (key: 'squareFootage'). If not found, use null.
+  Return ALL extracted properties as a single JSON list of objects. Each object in the list must represent one property and contain the keys 'url', 'price', 'address', 'bedrooms', 'bathrooms', and 'squareFootage'.
+  If no properties are found on the page, return an empty list [].
+  Example of expected output format: [{"url": "...", "price": "$500,000", "address": "123 Main St", "bedrooms": 3, "bathrooms": 2, "squareFootage": 1500}, {"url": "...", ...}]
+`;
+
 
 /**
  * Property Scraper Class
@@ -29,72 +79,109 @@ class PropertyScraper {
    * Call the Crawl4AI service to scrape data.
    * @param {string} url - The URL to scrape.
    * @param {string} prompt - The prompt for data extraction.
+   * @param {Object} headers - Optional headers to use for the request.
    * @returns {Promise<Object>} - The extracted data.
-   * @throws {Error} If scraping fails or the service returns an error.
+   * @throws {Error} If scraping fails after all retries.
    */
-  async callCrawl4aiService(url, prompt) {
+  async callCrawl4aiService(url, prompt, headers = null) { // Add headers parameter
     const targetUrl = `${this.crawl4aiServiceUrl}/scrape`; // Construct URL
-    console.log(`Attempting to call Crawl4AI service at: ${targetUrl}`); // Log the URL
-    try {
-      const response = await axios.post(targetUrl, { // Use the constructed URL
-        url,
-        prompt,
-      });
+    console.log(`[Debug] Attempting to call Crawl4AI service at: ${targetUrl}`);
+    console.log(`[Debug] Target URL for scraping: ${url}`);
+    // Log only the start of the prompt to avoid flooding logs
+    console.log(`[Debug] Prompt being used (start): ${prompt.substring(0, 150)}...`); 
 
-      if (response.data && response.data.success && response.data.data) {
-        return response.data.data;
-      } else {
-        const errorMessage = response.data?.error || 'Unknown error from Crawl4AI service';
-        throw new Error(`Crawl4AI service failed: ${errorMessage}`);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(`Attempt ${attempt}/${MAX_RETRIES} for ${url}...`);
+        // Include headers in the POST request body if provided
+        const postData = { url, prompt };
+        if (headers) {
+          postData.headers = headers; // Pass headers to the service if available
+          console.log(`[Debug] Sending headers to Crawl4AI service:`, headers);
+        } else {
+          console.log(`[Debug] Not sending custom headers to Crawl4AI service.`);
+        }
+        const response = await axios.post(targetUrl, postData);
+        
+        // Log raw response data for debugging
+        console.log(`[Debug] Raw response from Crawl4AI service (Attempt ${attempt}):`, JSON.stringify(response.data, null, 2));
+
+        // Check for success first
+        if (response.data && response.data.success) {
+          console.log(`Crawl4AI service succeeded for ${url} on attempt ${attempt}.`);
+          // Return the data, which might be null if nothing was extracted
+          return response.data.data;
+        } else {
+          // If success is false, or response format is unexpected, log and prepare for retry or final failure
+          const errorMessage = response.data?.error || 'Unknown error or invalid response from Crawl4AI service';
+          console.warn(`Crawl4AI service indicated failure for ${url} on attempt ${attempt}: ${errorMessage}`);
+          // Throw an error to trigger the catch block for retry logic
+          throw new Error(`Crawl4AI service failed: ${errorMessage}`);
+        }
+      } catch (error) {
+        const errorMessage = error.response?.data?.detail || error.message; // Prefer detail if available from FastAPI error
+        console.warn(`Error calling Crawl4AI service for ${url} on attempt ${attempt}: ${errorMessage}`);
+
+        if (attempt === MAX_RETRIES) {
+          console.error(`All ${MAX_RETRIES} attempts failed for ${url}.`);
+          throw new Error(`Failed to scrape ${url} after ${MAX_RETRIES} attempts: ${errorMessage}`); // Throw final error
+        }
+
+        // Wait before retrying
+        console.log(`Waiting ${RETRY_DELAY}ms before next attempt...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
       }
-    } catch (error) {
-      const errorMessage = error.response?.data?.detail || error.message;
-      console.error(`Error calling Crawl4AI service for ${url}: ${errorMessage}`);
-      throw new Error(`Failed to scrape ${url}: ${errorMessage}`);
     }
+     // This line should theoretically not be reached if MAX_RETRIES > 0
+     throw new Error(`Failed to scrape ${url} after ${MAX_RETRIES} attempts.`);
   }
 
 
   /**
    * Scrape property listings from a given URL/source configuration
-   * @param {string} sourceConfig - Object containing url, filters, and potentially listing prompt
-   * @returns {Promise<Array>} - Array of property listing data (e.g., [{ url: '...', price: '...', address: '...' }])
+   * @param {Object} options - Object containing source, url, filters, listingPrompt, and headers
+   * @returns {Promise<Object|null>} - Extracted data object (e.g., { items: [...] }) or null on failure.
    */
-  async scrapeListings(sourceConfig) {
-    const { url, filters = {}, listingPrompt } = sourceConfig;
-    console.log(`Scraping property listings from: ${url}`);
-    console.log('Filters:', filters); // Note: Filters are not directly used in scrape call, but might inform the prompt
+  async scrapeListings(options) {
+    // Destructure options, including headers
+    const { source, url, filters = {}, listingPrompt, headers } = options; 
+    console.log(`Scraping property listings from ${source} at: ${url}`);
+    console.log('Filters:', filters);
 
-    // Define a generic prompt or use one from sourceConfig
-    const prompt = listingPrompt || `
-      Scrape this page listing multiple real estate properties for sale.
-      Extract the following information for each property listed:
-      - The direct URL to the property's detail page (as 'url')
-      - The listed price (as 'price')
-      - The full street address (as 'address')
-      - Number of bedrooms (as 'bedrooms')
-      - Number of bathrooms (as 'bathrooms')
-      - Square footage (as 'squareFootage')
-      Return the result as a JSON list of objects, where each object represents a property.
-      Example: [{"url": "...", "price": "$500,000", "address": "123 Main St", "bedrooms": 3, "bathrooms": 2, "squareFootage": 1500}, ...]
-    `;
+    // Use the provided listingPrompt (already enhanced in workflow manager)
+    // Fallback logic is removed as enhancement happens upstream
+    const prompt = listingPrompt; 
+    if (!prompt) {
+        console.error(`[Error] No prompt provided for scrapeListings source: ${source}`);
+        throw new Error(`No prompt available for source ${source}`);
+    }
+    // Log start of the prompt (which is now the enhanced one)
+    console.log(`Using enhanced prompt for source "${source}":\n${prompt.substring(0, 150)}...`); 
 
     try {
-      const extractedData = await this.callCrawl4aiService(url, prompt);
+      // Pass headers to callCrawl4aiService
+      const extractedData = await this.callCrawl4aiService(url, prompt, headers); 
 
-      // Validate the structure of the returned data (should be a list)
-      if (!Array.isArray(extractedData)) {
-          console.error("Crawl4AI service did not return a list for listings:", extractedData);
-          throw new Error("Expected a list of listings from Crawl4AI service, but received a different type.");
+      // The workflow manager now handles the default empty structure.
+      // This function should return the raw data (or null) received from the service.
+      if (extractedData === null) {
+          console.log(`Crawl4AI service returned null data for ${url}.`);
+          return null; // Return null as received
       }
 
-      console.log(`Scraped ${extractedData.length} potential property listings from ${url}`);
-      // Further validation could be added here to check if objects have expected keys (url, price, etc.)
-      return extractedData;
+      // Basic validation: Check if it's an object or list (as expected from enhanced prompt)
+      if (typeof extractedData !== 'object' && !Array.isArray(extractedData)) {
+           console.error(`Crawl4AI service returned unexpected data type: ${typeof extractedData}`, extractedData);
+           // Return null or throw error based on desired strictness
+           return null; 
+      }
+
+      // Log success and return the data
+      console.log(`Successfully received data structure from Crawl4AI for ${url}`);
+      return extractedData; // Return the object/list received
 
     } catch (error) {
-        console.error(`Error scraping property listings from ${url}: ${error.message}`);
-        // Decide how to handle errors - skip source, retry, etc. Here we re-throw.
+        console.error(`Error in scrapeListings calling Crawl4AI for ${url}: ${error.message}`);
         throw error;
     }
   }
