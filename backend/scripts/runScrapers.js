@@ -1,6 +1,8 @@
 // Script to run property and rental scraping jobs
 const ScraperWorkflowManager = require('./scraperWorkflow');
 const dotenv = require('dotenv');
+const { initPostgresSchema } = require('../config/dbInit'); // Import DB init function
+const { pgPool } = require('../config/db'); // Import PG Pool
 
 // Load environment variables
 dotenv.config();
@@ -8,13 +10,42 @@ dotenv.config();
 // Initialize scraper workflow manager
 const scraperManager = new ScraperWorkflowManager();
 
+// Generic listing prompt (defined once, used below)
+// Enhanced to be more specific about targeting listings and requiring URL
+const GENERIC_LISTING_PROMPT = `
+  Analyze this real estate search results page which lists multiple properties for sale.
+  Identify the main container holding the list or grid of individual property listings.
+  Focus ONLY on the elements that clearly represent a single property for sale. Ignore headers, footers, ads, pagination controls, map elements, or other non-listing content.
+  For EACH distinct property listing element identified:
+  - Extract the direct URL link to the property's own detail page. This is CRITICAL. If a listing element does not contain a valid URL to its detail page, SKIP that element entirely. (key: 'url').
+  - Extract the listed sale price (key: 'price'). Use null if not found.
+  - Extract the full street address (key: 'address'). Use null if not found.
+  - Number of bedrooms (key: 'bedrooms'). Use null if not found.
+  - Number of bathrooms (key: 'bathrooms'). Use null if not found.
+  - Square footage (key: 'squareFootage'). Use null if not found.
+  Return ONLY the valid property listings found as a single JSON list of objects. Each object MUST have a non-null 'url' key.
+  If no valid property listings with URLs are found, return an empty list [].
+  Example of expected output format: [{"url": "https://...", "price": "$500,000", "address": "123 Main St", "bedrooms": 3, "bathrooms": 2, "squareFootage": 1500}, {"url": "https://...", ...}]
+`;
+
 // Define sources and URLs for scraping
 const propertySources = [
   {
     name: 'bookstoscrape-test', // New test case using books.toscrape.com
     url: 'http://books.toscrape.com/', // Use http as https might not be configured
     filters: {}, // No filters needed
-    // Simplified prompt with explicit structure
+    // Define CSS schema for direct extraction
+    listingSchema: {
+      baseSelector: "article.product_pod", // Selector for each item
+      fields: [
+        { name: "title", selector: "h3 a", type: "attribute", attribute: "title" }, // Get title from 'title' attribute
+        { name: "price", selector: ".price_color", type: "text" },
+        { name: "stock", selector: ".availability", type: "text" },
+        // Corrected: Ensure 'url' field correctly targets the href attribute
+        { name: "url", selector: "h3 a", type: "attribute", attribute: "href" }
+      ]
+    },
+    // Keep the prompt as a fallback or for potential future use, but schema takes precedence
     listingPrompt: `
       Analyze the HTML and extract books data.
       Target: Find all article.product_pod elements
@@ -24,7 +55,8 @@ const propertySources = [
           {
             "title": "{{text from h3 a}}",
             "price": "{{text from .price_color}}",
-            "stock": "{{text from .availability}}"
+            "stock": "{{text from .availability}}",
+            "url": "{{href from h3 a}}"
           }
         ]
       }
@@ -37,40 +69,13 @@ const propertySources = [
   },
   {
     name: 'zillow',
-    // Construct Zillow URL dynamically using searchQueryState parameter
+    // Simplify Zillow URL generation - just use base city/state path
     getUrl: (filters) => {
       const cityState = `${filters.city}-${filters.state}`.toLowerCase().replace(/ /g, '-');
-      const baseUrl = `https://www.zillow.com/${cityState}/`; // Base path seems correct
-
-      // Construct the filterState object based on provided filters
-      const filterState = {
-        sort: { value: 'globalrelevanceex' }, // Default sort, might need adjustment
-        price: {},
-        mp: {}, // Monthly payment, might need calculation or omit
-        beds: {},
-        baths: {},
-      };
-      if (filters.minPrice !== undefined) filterState.price.min = filters.minPrice;
-      if (filters.maxPrice !== undefined) filterState.price.max = filters.maxPrice;
-      // Assuming monthly payment calculation is complex and not directly mapped, omitting mp for now
-      if (filters.bedrooms !== undefined) filterState.beds.min = filters.bedrooms;
-      if (filters.bathrooms !== undefined) filterState.baths.min = filters.bathrooms;
-
-      // Construct the full searchQueryState object
-      const searchQueryState = {
-        pagination: {},
-        isMapVisible: false, // Assuming list view is preferred
-        // mapBounds and regionSelection might be dynamic based on location, hard to replicate exactly without more info
-        // Using a simplified version for now
-        filterState: filterState,
-        isListVisible: true,
-        usersSearchTerm: `${filters.city} ${filters.state}` // Reflects the search term
-      };
-
-      // Encode the JSON object for the URL query parameter
-      const encodedSearchQuery = encodeURIComponent(JSON.stringify(searchQueryState));
-      
-      return `${baseUrl}?searchQueryState=${encodedSearchQuery}`;
+      // Return only the base URL. Filters will need to be applied manually on Zillow or handled differently.
+      // This avoids relying on the complex and brittle searchQueryState parameter.
+      console.warn(`[Zillow URL] Using simplified URL: https://www.zillow.com/${cityState}/. Filters are not applied via URL.`);
+      return `https://www.zillow.com/${cityState}/`;
     },
     filters: {
       city: 'San Francisco',
@@ -79,7 +84,46 @@ const propertySources = [
       maxPrice: 1500000,
       bedrooms: 2,
       bathrooms: 2
-    }
+    },
+    // Define CSS schema for Zillow listings
+    listingSchema: {
+      baseSelector: "article[data-test='property-card']", // Target the article element
+      fields: [
+        // Use more specific selectors based on the prompt examples
+        { name: "address", selector: "address[data-test='property-card-addr']", type: "text" },
+        { name: "price", selector: "span[data-test='property-card-price']", type: "text" },
+        // Replace :contains() with standard selectors targeting list items within the card details container
+        // Assuming a structure like <ul class="StyledPropertyCardHomeDetailsList-c11n-8-100-1__sc-1xvdaej-0 ehrLVA"><li><span>3</span> bds</li>...
+        // We'll grab the text of all list items and let the backend parse beds/baths/sqft
+        { name: "details", selector: "[data-test='property-card-details'] li", type: "text[]" }, // Get text of all list items
+        { name: "url", selector: "a[data-test='property-card-link']", type: "attribute", attribute: "href" }
+      ]
+    },
+    // Keep the prompt as a fallback or for potential future use
+    // Keep the prompt as a fallback or for potential future use
+    listingPrompt: `
+      Analyze the HTML and extract property listings.
+      Target: Find all article elements that represent a property listing (e.g., .list-card, .property-card).
+      Required format:
+      {
+        "items": [
+          {
+            "address": "{{text from address element, e.g., .list-card-addr}}",
+            "price": "{{text from price element, e.g., .list-card-price}}",
+            "beds": "{{text containing beds info, e.g., .list-card-details li containing 'bds'}}",
+            "baths": "{{text containing baths info, e.g., .list-card-details li containing 'ba'}}",
+            "sqft": "{{text containing sqft info, e.g., .list-card-details li containing 'sqft'}}",
+            "url": "{{href from main listing link, e.g., a.list-card-link}}"
+          }
+        ]
+      }
+      Notes:
+      - Return ONLY the JSON object.
+      - Extract numeric values for beds, baths, sqft if possible, otherwise text.
+      - Clean price (remove $, commas, /mo).
+      - Ensure URL is absolute or prepend with base URL if relative.
+      - Empty result should be {"items": []}
+    `
   },
   {
     name: 'realtor',
@@ -121,7 +165,32 @@ const propertySources = [
       maxPrice: 800000,
       bedrooms: 3,
       bathrooms: 2
-    }
+    },
+    // Removed listingSchema for Realtor - will use GENERIC_LISTING_PROMPT instead
+    listingPrompt: GENERIC_LISTING_PROMPT // Use the refined generic prompt
+    /* Old Realtor Prompt (kept for reference if needed):
+      Analyze the HTML and extract property listings.
+      Target: Find all elements representing a property card (e.g., [data-testid=property-card], .card-component).
+      Required format:
+      {
+        "items": [
+          {
+            "address": "{{text from address element, e.g., [data-testid=card-address]}}",
+            "price": "{{text from price element, e.g., .card-price}}",
+            "beds": "{{text from beds element, e.g., li[data-testid=property-meta-beds] .meta-value}}",
+            "baths": "{{text from baths element, e.g., li[data-testid=property-meta-baths] .meta-value}}",
+            "sqft": "{{text from sqft element, e.g., li[data-testid=property-meta-sqft] .meta-value}}",
+            "url": "{{href from main listing link, e.g., a[data-testid=card-link]}}"
+          }
+        ]
+      }
+      Notes:
+      - Return ONLY the JSON object.
+      - Extract numeric values for beds, baths, sqft if possible, otherwise text.
+      - Clean price (remove $, commas).
+      - Ensure URL is absolute or prepend with base URL if relative.
+      - Empty result should be {"items": []}
+    */
   },
   {
     name: 'ohiobrokerdirect',
@@ -153,7 +222,9 @@ const propertySources = [
       minPrice: 100000,
       maxPrice: 500000,
       bedrooms: 2 // Assuming 'bedrooms' means minimum bedrooms
-    }
+    },
+    // Add a generic fallback prompt
+    listingPrompt: GENERIC_LISTING_PROMPT
   },
   {
     name: 'lotside',
@@ -185,9 +256,13 @@ const propertySources = [
       minPrice: 100000,
       maxPrice: 500000,
       bedrooms: 2 // Assuming 'bedrooms' means minimum bedrooms
-    }
+    },
+    // Add a generic fallback prompt
+    listingPrompt: GENERIC_LISTING_PROMPT
   }
 ];
+
+// Removed GENERIC_LISTING_PROMPT definition from here as it's moved above
 
 const rentalSources = [
   {
@@ -266,7 +341,20 @@ const rentalSources = [
       state: 'IL',
       bedrooms: 1,
       bathrooms: 1
-    }
+    },
+    // Add a specific prompt for Zillow rentals to improve URL extraction
+    listingPrompt: `
+      Analyze this Zillow rental search results page. Locate the main container for listings (e.g., #grid-search-results).
+      Within this container, find all property card elements (e.g., article[data-test='property-card']).
+      For each property card:
+      - Extract the direct URL link to the rental's detail page from the primary link element (e.g., a[data-test='property-card-link']). This is the MOST important field. (key: 'url').
+      - Extract the monthly rent price (e.g., span[data-test='property-card-price']). (key: 'rent').
+      - Extract the full street address (e.g., address[data-test='property-card-addr']). (key: 'address').
+      - Extract bedrooms, bathrooms, and square footage if available within the card details. (keys: 'bedrooms', 'bathrooms', 'squareFootage').
+      Return ONLY the valid rental listings found as a single JSON list of objects. Each object MUST have a non-null 'url' key.
+      If no valid rental listings with URLs are found, return an empty list [].
+      Example: [{"url": "https://www.zillow.com/homedetails/...", "rent": "$3,000/mo", "address": "789 Pine St", "bedrooms": 1, "bathrooms": 1, "squareFootage": 700}, ...]
+    `
   }
 ];
 
@@ -290,8 +378,14 @@ async function runPropertyScrapingJobs() {
       }
 
       console.log(`Running property scraping job for ${source.name} with URL: ${url}`);
-      // Pass name, calculated url, filters, and prompt separately
-      const result = await scraperManager.runPropertyScrapingJob(source.name, url, source.filters, source.listingPrompt); 
+      // Determine whether to pass schema or prompt
+      const promptOrSchema = source.listingSchema ? source.listingSchema : source.listingPrompt;
+      if (!promptOrSchema) {
+        console.error(`Missing listingSchema or listingPrompt for source: ${source.name}`);
+        continue; // Skip if neither is defined
+      }
+      // Pass the determined schema or prompt (Corrected variable name)
+      const result = await scraperManager.runPropertyScrapingJob(source.name, url, source.filters, promptOrSchema);
       console.log(`Property scraping job for ${source.name} completed:`, result);
     } catch (error) {
       console.error(`Error running property scraping job for ${source.name}:`, error.message, error.stack); // Added stack trace
@@ -309,7 +403,8 @@ async function runRentalScrapingJobs() {
     try {
       const url = source.getUrl(source.filters); // Get dynamic URL
       console.log(`Running rental scraping job for ${source.name} with URL: ${url}`);
-      const result = await scraperManager.runRentalScrapingJob(source.name, url, source.filters);
+      // Pass the listingPrompt if it exists in the source config
+      const result = await scraperManager.runRentalScrapingJob(source.name, url, source.filters, source.listingPrompt); 
       console.log(`Rental scraping job for ${source.name} completed:`, result);
     } catch (error) {
       console.error(`Error running rental scraping job for ${source.name}:`, error.message, error.stack); // Added stack trace
@@ -321,12 +416,31 @@ async function runRentalScrapingJobs() {
 
 // Main function to run all scraping jobs
 async function main() {
+  let pgClient; // Define client here to use in finally block
   try {
+    // Initialize PostgreSQL Schema FIRST
+    console.log('Attempting to initialize PostgreSQL schema...');
+    pgClient = await pgPool.connect();
+    await initPostgresSchema(pgClient);
+    console.log('PostgreSQL schema initialization check complete.');
+    pgClient.release(); // Release client after init
+    pgClient = null; // Set to null after release
+
+    // Now run the scraping jobs
     await runPropertyScrapingJobs();
     await runRentalScrapingJobs();
     console.log('All scraping jobs completed successfully');
   } catch (error) {
-    console.error('Error running scraping jobs:', error.message);
+    console.error('Error during initialization or running scraping jobs:', error.message, error.stack); // Added stack trace
+  } finally {
+    // Ensure client is released if an error occurred after connect but before release
+    if (pgClient) {
+      pgClient.release();
+      console.log('Ensured PostgreSQL client was released after error.');
+    }
+    // Optionally end the pool if this script is meant to be short-lived
+    // await pgPool.end(); 
+    // console.log('PostgreSQL pool ended.');
   }
 }
 

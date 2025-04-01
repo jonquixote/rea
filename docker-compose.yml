@@ -37,6 +37,7 @@ services:
       # Add any other Python service env vars if needed
     volumes:
       - ./crawl4ai-service:/app # Mount for development (optional)
+    shm_size: '2gb' # Increase shared memory size for Playwright/Browser
     networks:
       real-estate-net:
         aliases:

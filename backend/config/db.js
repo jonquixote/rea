@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { Pool } = require('pg');
+// const { initPostgresSchema } = require('./dbInit'); // Reverted: Remove import
 // const path = require('path'); // Import path module - Not needed when relying on Docker Compose env vars
 // require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // Specify path to .env - Docker Compose injects env vars
 
@@ -30,16 +31,18 @@ const pgPool = new Pool({
 });
 
 // Test PostgreSQL Connection
+// Test PostgreSQL Connection
 const connectPostgreSQL = async () => {
   try {
     const client = await pgPool.connect();
     console.log('PostgreSQL Connected');
-    client.release();
+    client.release(); // Release client after testing connection
     return pgPool;
   } catch (error) {
     console.error(`Error connecting to PostgreSQL: ${error.message}`);
     process.exit(1);
-  }
+  } 
+  // Removed finally block as client release is handled in try block now
 };
 
 module.exports = { connectMongoDB, connectPostgreSQL, pgPool };

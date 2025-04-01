@@ -46,6 +46,30 @@ const SITE_SPECIFIC_LISTING_PROMPTS = {
     Return ALL extracted properties as a single JSON list of objects. Each object must have keys 'url', 'price', 'address', 'bedrooms', 'bathrooms', 'squareFootage'. Use null if a value isn't found.
     If no properties are found, return an empty list [].
   `,
+  ohiobrokerdirect: `
+    Analyze this OhioBrokerDirect search results page. Identify each property listing container, often marked with class="IDX-listingContainer" or similar structure containing listing details.
+    For EACH property listing found:
+    - Extract the direct URL link to the property's detail page. This is often within an 'a' tag containing the address or a "View Details" link (key: 'url'). Look for links pointing to '/idx/details/listing/...'.
+    - Extract the price, usually prefixed with '$' (key: 'price').
+    - Extract the full street address (key: 'address').
+    - Extract the number of bedrooms (key: 'bedrooms').
+    - Extract the number of bathrooms (key: 'bathrooms').
+    - Extract the square footage (key: 'squareFootage').
+    Return ALL extracted properties as a single JSON list of objects. Each object must have keys 'url', 'price', 'address', 'bedrooms', 'bathrooms', 'squareFootage'. Use null if a value isn't found.
+    If no properties are found, return an empty list [].
+  `,
+  lotside: `
+    Analyze this Lotside browse page. Identify the main container holding property cards or listings. These might be divs with specific classes related to 'property', 'card', or 'listing'.
+    For EACH property card/listing found:
+    - Extract the direct URL link to the property's detail page. This might be associated with the address or an image (key: 'url'). Look for links pointing to '/property/...' or similar.
+    - Extract the listed price (key: 'price').
+    - Extract the full street address (key: 'address').
+    - Extract the number of bedrooms (key: 'bedrooms').
+    - Extract the number of bathrooms (key: 'bathrooms').
+    - Extract the square footage (key: 'squareFootage').
+    Return ALL extracted properties as a single JSON list of objects. Each object must have keys 'url', 'price', 'address', 'bedrooms', 'bathrooms', 'squareFootage'. Use null if a value isn't found.
+    If no properties are found, return an empty list [].
+  `
   // Add other source-specific prompts here if needed
 };
 
@@ -78,42 +102,67 @@ class PropertyScraper {
   /**
    * Call the Crawl4AI service to scrape data.
    * @param {string} url - The URL to scrape.
-   * @param {string} prompt - The prompt for data extraction.
-   * @param {Object} headers - Optional headers to use for the request.
+   * @param {string | null} prompt - The prompt for LLM extraction (null if using schema).
+   * @param {Object | null} schema - The CSS schema for direct extraction (null if using prompt).
+   * @param {Object | null} headers - Optional headers to use for the request.
    * @returns {Promise<Object>} - The extracted data.
    * @throws {Error} If scraping fails after all retries.
    */
-  async callCrawl4aiService(url, prompt, headers = null) { // Add headers parameter
+  async callCrawl4aiService(url, prompt, schema, headers = null) { // Added schema parameter
     const targetUrl = `${this.crawl4aiServiceUrl}/scrape`; // Construct URL
     console.log(`[Debug] Attempting to call Crawl4AI service at: ${targetUrl}`);
     console.log(`[Debug] Target URL for scraping: ${url}`);
-    // Log only the start of the prompt to avoid flooding logs
-    console.log(`[Debug] Prompt being used (start): ${prompt.substring(0, 150)}...`); 
+
+    // Construct POST data, including either prompt or schema
+    const postData = { url };
+    if (schema) {
+      postData.schema = schema;
+      console.log(`[Debug] Using CSS Schema for extraction:`, schema);
+    } else if (prompt) {
+      postData.prompt = prompt;
+      // Log only the start of the prompt to avoid flooding logs
+      console.log(`[Debug] Using LLM Prompt for extraction (start): ${prompt.substring(0, 150)}...`);
+    } else {
+      // Should not happen if called correctly from scrapeListings/scrapePropertyDetails
+      throw new Error("Must provide either a prompt or a schema to callCrawl4aiService.");
+    }
+
+    // Add headers if provided
+    if (headers) {
+      postData.headers = headers; // Pass headers to the service if available
+      console.log(`[Debug] Sending headers to Crawl4AI service:`, headers);
+    } else {
+      console.log(`[Debug] Not sending custom headers to Crawl4AI service.`);
+    }
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         console.log(`Attempt ${attempt}/${MAX_RETRIES} for ${url}...`);
-        // Include headers in the POST request body if provided
-        const postData = { url, prompt };
-        if (headers) {
-          postData.headers = headers; // Pass headers to the service if available
-          console.log(`[Debug] Sending headers to Crawl4AI service:`, headers);
-        } else {
-          console.log(`[Debug] Not sending custom headers to Crawl4AI service.`);
-        }
         const response = await axios.post(targetUrl, postData);
-        
+
         // Log raw response data for debugging
         console.log(`[Debug] Raw response from Crawl4AI service (Attempt ${attempt}):`, JSON.stringify(response.data, null, 2));
 
-        // Check for success first
-        if (response.data && response.data.success) {
-          console.log(`Crawl4AI service succeeded for ${url} on attempt ${attempt}.`);
-          // Return the data, which might be null if nothing was extracted
-          return response.data.data;
+        // Check for success and potential errors within the response data
+        if (response.data) {
+            if (response.data.success && response.data.error) {
+                // Success reported, but an error message exists (e.g., parsing failed, LLM error)
+                console.warn(`Crawl4AI service succeeded for ${url} but reported an error: ${response.data.error}`);
+                // Treat this as a failure for retry purposes
+                throw new Error(`Crawl4AI service error: ${response.data.error}`);
+            } else if (response.data.success) {
+                // True success, data might be null if nothing found/extracted
+                console.log(`Crawl4AI service succeeded for ${url} on attempt ${attempt}.`);
+                return response.data.data;
+            } else {
+                // Explicit failure reported by the service (success: false)
+                const errorMessage = response.data.error || 'Unknown error from Crawl4AI service (success: false)';
+                console.warn(`Crawl4AI service indicated failure for ${url} on attempt ${attempt}: ${errorMessage}`);
+                throw new Error(`Crawl4AI service failed: ${errorMessage}`);
+            }
         } else {
-          // If success is false, or response format is unexpected, log and prepare for retry or final failure
-          const errorMessage = response.data?.error || 'Unknown error or invalid response from Crawl4AI service';
+          // If response.data itself is missing or malformed
+          const errorMessage = 'Invalid or empty response from Crawl4AI service';
           console.warn(`Crawl4AI service indicated failure for ${url} on attempt ${attempt}: ${errorMessage}`);
           // Throw an error to trigger the catch block for retry logic
           throw new Error(`Crawl4AI service failed: ${errorMessage}`);
@@ -139,31 +188,35 @@ class PropertyScraper {
 
   /**
    * Scrape property listings from a given URL/source configuration
-   * @param {Object} options - Object containing source, url, filters, listingPrompt, and headers
+   * @param {Object} options - Object containing source, url, filters, listingPrompt or listingSchema, and headers
    * @returns {Promise<Object|null>} - Extracted data object (e.g., { items: [...] }) or null on failure.
    */
   async scrapeListings(options) {
-    // Destructure options, including headers
-    const { source, url, filters = {}, listingPrompt, headers } = options; 
+    // Destructure options, including potential schema and prompt
+    const { source, url, filters = {}, listingPrompt, listingSchema, headers } = options;
     console.log(`Scraping property listings from ${source} at: ${url}`);
     console.log('Filters:', filters);
 
-    // Use the provided listingPrompt (already enhanced in workflow manager)
-    // Fallback logic is removed as enhancement happens upstream
-    const prompt = listingPrompt; 
-    if (!prompt) {
-        console.error(`[Error] No prompt provided for scrapeListings source: ${source}`);
-        throw new Error(`No prompt available for source ${source}`);
+    // Determine if using schema or prompt
+    const useSchema = !!listingSchema;
+    console.log(`Using ${useSchema ? 'CSS Schema' : 'LLM Prompt'} for ${source} listings.`);
+
+    if (!useSchema && !listingPrompt) {
+        console.error(`[Error] No listingPrompt or listingSchema provided for scrapeListings source: ${source}`);
+        throw new Error(`No prompt or schema available for source ${source}`);
     }
-    // Log start of the prompt (which is now the enhanced one)
-    console.log(`Using enhanced prompt for source "${source}":\n${prompt.substring(0, 150)}...`); 
 
     try {
-      // Pass headers to callCrawl4aiService
-      const extractedData = await this.callCrawl4aiService(url, prompt, headers); 
+      // Call service with either prompt or schema (pass null for the one not used)
+      const extractedData = await this.callCrawl4aiService(
+        url,
+        useSchema ? null : listingPrompt, // Pass prompt only if not using schema
+        useSchema ? listingSchema : null, // Pass schema only if using schema
+        headers
+      );
 
-      // The workflow manager now handles the default empty structure.
-      // This function should return the raw data (or null) received from the service.
+      // The workflow manager handles the default empty structure.
+      // This function returns the raw data (or null) received from the service.
       if (extractedData === null) {
           console.log(`Crawl4AI service returned null data for ${url}.`);
           return null; // Return null as received
@@ -264,10 +317,12 @@ class PropertyScraper {
           INSERT INTO properties (
             address, city, state, zip, location, price, 
             bedrooms, bathrooms, square_footage, year_built, 
-            lot_size, property_type, hoa_fees, tax_info, description
+            lot_size, property_type, hoa_fees, tax_info, description,
+            listing_url -- Added listing_url column
           ) VALUES (
             $1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography, $7, 
-            $8, $9, $10, $11, $12, $13, $14, $15, $16
+            $8, $9, $10, $11, $12, $13, $14, $15, $16,
+            $17 -- Added parameter for listing_url
           ) RETURNING id;
         `;
         
@@ -291,7 +346,8 @@ class PropertyScraper {
           cleanedData.propertyType,
           cleanedData.hoaFees,
           cleanedData.taxInfo,
-          propertyData.description || ''
+          propertyData.description || '',
+          propertyData.scrapedUrl || null // Add scrapedUrl (or null if missing) as the 17th parameter
         ]);
         
         const pgPropertyId = pgResult.rows[0].id;

@@ -95,15 +95,22 @@ class RentalEstimatorScraper {
           return [];
       }
 
-      // If it's not null, validate that it's an array.
-      if (!Array.isArray(extractedData)) {
-          console.error("Crawl4AI service did not return a list or null for rental listings:", extractedData);
-          throw new Error("Expected a list of rental listings or null from Crawl4AI service, but received a different type.");
+      // Check if the response is an object with an 'items' key which is an array
+      if (typeof extractedData === 'object' && extractedData !== null && Array.isArray(extractedData.items)) {
+          const listings = extractedData.items;
+          console.log(`Scraped ${listings.length} potential rental listings from ${url}`);
+          return listings; // Return the items array
       }
-
-      // If it's a valid array, log and return it.
-      console.log(`Scraped ${extractedData.length} potential rental listings from ${url}`);
-      return extractedData;
+      // Check if it's already a direct array (for backward compatibility or other sources)
+      else if (Array.isArray(extractedData)) {
+          console.log(`Scraped ${extractedData.length} potential rental listings from ${url}`);
+          return extractedData; // Return the direct array
+      }
+      // If it's neither null, an object with items array, nor a direct array, it's an error
+      else {
+          console.error("Crawl4AI service did not return a list, null, or {items: [...]} for rental listings:", extractedData);
+          throw new Error("Expected a list, null, or {items: [...]} from Crawl4AI service, but received a different type.");
+      }
 
     } catch (error) {
         console.error(`Error scraping rental listings from ${url}: ${error.message}`);
@@ -175,8 +182,65 @@ class RentalEstimatorScraper {
   async saveRentalData(rentalData) {
     console.log(`Saving rental data for: ${rentalData.address}`);
 
+    // --- Data Cleaning ---
+    let cleanedRent = null;
+    if (rentalData.actualRent && typeof rentalData.actualRent === 'string') {
+      const rentString = rentalData.actualRent.replace(/[$,\/moMonth\s+]/gi, ''); // Remove $, commas, /mo, /Month, spaces
+      cleanedRent = parseFloat(rentString);
+      if (isNaN(cleanedRent)) {
+        console.warn(`Could not parse rent: ${rentalData.actualRent}`);
+        cleanedRent = null; // Set to null if parsing failed
+      }
+    } else if (typeof rentalData.actualRent === 'number') {
+       cleanedRent = rentalData.actualRent; // Already a number
+    }
+
+    let cleanedSqft = null;
+    if (rentalData.squareFootage && typeof rentalData.squareFootage === 'string') {
+      const sqftString = rentalData.squareFootage.replace(/[,sqft\s]/gi, ''); // Remove commas, sq ft, spaces
+      cleanedSqft = parseInt(sqftString, 10);
+       if (isNaN(cleanedSqft)) {
+        console.warn(`Could not parse square footage: ${rentalData.squareFootage}`);
+        cleanedSqft = null; // Set to null if parsing failed
+      }
+    } else if (typeof rentalData.squareFootage === 'number') {
+        cleanedSqft = rentalData.squareFootage; // Already a number
+    }
+
+    let cleanedDate = new Date(); // Default to now
+    if (rentalData.listingDate && typeof rentalData.listingDate === 'string') {
+        const dateString = rentalData.listingDate.toLowerCase();
+        if (dateString.includes('today')) {
+            // Already defaulted to today
+        } else if (dateString.includes('yesterday')) {
+            cleanedDate.setDate(cleanedDate.getDate() - 1);
+        } else if (dateString.includes('day ago') || dateString.includes('days ago')) {
+            const days = parseInt(dateString.replace(/\D/g, ''), 10);
+            if (!isNaN(days)) {
+                cleanedDate.setDate(cleanedDate.getDate() - days);
+            }
+        } else if (dateString.includes('week ago') || dateString.includes('weeks ago')) {
+             const weeks = parseInt(dateString.replace(/\D/g, ''), 10);
+            if (!isNaN(weeks)) {
+                cleanedDate.setDate(cleanedDate.getDate() - (weeks * 7));
+            }
+        } else {
+            // Try parsing as a standard date string if possible
+            const parsed = Date.parse(rentalData.listingDate);
+            if (!isNaN(parsed)) {
+                cleanedDate = new Date(parsed);
+            } else {
+                 console.warn(`Could not parse listing date: ${rentalData.listingDate}. Defaulting to today.`);
+            }
+        }
+    } else if (rentalData.listingDate instanceof Date) {
+        cleanedDate = rentalData.listingDate; // Already a Date object
+    }
+    // --- End Data Cleaning ---
+
+
     try {
-      // Create new rental training data document
+      // Create new rental training data document using cleaned data
       const rentalTrainingData = new RentalTrainingData({
         address: rentalData.address,
         city: rentalData.city,
@@ -184,15 +248,18 @@ class RentalEstimatorScraper {
         zip: rentalData.zip,
         bedrooms: rentalData.bedrooms,
         bathrooms: rentalData.bathrooms,
-        squareFootage: rentalData.squareFootage,
+        squareFootage: cleanedSqft, // Use cleaned value
         propertyType: rentalData.propertyType,
         yearBuilt: rentalData.yearBuilt,
         amenities: rentalData.features || [],
-        actualRent: rentalData.rent,
-        listingDate: rentalData.listingDate || new Date(),
+        actualRent: cleanedRent, // Use cleaned value
+        listingDate: cleanedDate, // Use cleaned value
         source: rentalData.source || 'unknown',
         metadata: {
-          scrapedAt: new Date()
+          scrapedAt: new Date(),
+          originalRentString: rentalData.actualRent, // Keep original for reference if needed
+          originalSqftString: rentalData.squareFootage,
+          originalDateString: rentalData.listingDate
         }
       });
       

@@ -35,21 +35,26 @@ class ScraperWorkflowManager {
    * @param {string} source - Source website name (e.g., 'zillow', 'realtor')
    * @param {string} url - Base URL to scrape
    * @param {Object} filters - Search filters
-   * @param {string} listingPrompt - The specific prompt for extracting listings
+   * @param {string | Object} listingPromptOrSchema - The specific prompt or CSS schema for extracting listings
    * @returns {Promise<Object>} - Job results including success status and data/error
    */
-  async runPropertyScrapingJob(source, url, filters = {}, listingPrompt) {
+  async runPropertyScrapingJob(source, url, filters = {}, listingPromptOrSchema) { // Renamed parameter
     console.log(`[DEBUG] Starting extraction for ${source}`);
     console.log(`[DEBUG] URL: ${url}`);
-    console.log(`[DEBUG] Prompt length: ${listingPrompt?.length || 0}`);
+    // Log whether we have a schema or a prompt
+    const hasSchema = typeof listingPromptOrSchema === 'object' && listingPromptOrSchema !== null && listingPromptOrSchema.baseSelector;
+    console.log(`[DEBUG] Using ${hasSchema ? 'CSS Schema' : 'LLM Prompt'}`);
+    if (!hasSchema) {
+      console.log(`[DEBUG] Prompt length: ${listingPromptOrSchema?.length || 0}`);
+    }
     console.log(`[DEBUG] Using headers:`, this.headers); // Log headers being used
 
     let scrapingJob; // Define scrapingJob here to access in finally block if needed
 
     try {
-      // Validate URL and prompt
-      if (!url || !listingPrompt) {
-        throw new Error('Missing required URL or prompt for property scraping job.');
+      // Validate URL and prompt/schema
+      if (!url || !listingPromptOrSchema) {
+        throw new Error('Missing required URL or listingPrompt/listingSchema for property scraping job.');
       }
 
       // Ensure MongoDB is connected
@@ -66,10 +71,23 @@ class ScraperWorkflowManager {
       });
       await scrapingJob.save();
 
-      // Enhance the prompt with structure hints
-      const enhancedPrompt = `
+      // Prepare options for scrapeListings
+      const scrapeOptions = {
+        source,
+        url,
+        filters,
+        headers: this.headers // Pass headers here
+      };
+
+      // Add either schema or enhanced prompt based on what was passed
+      if (hasSchema) {
+        scrapeOptions.listingSchema = listingPromptOrSchema;
+        console.log('[DEBUG] Passing listingSchema to scrapeListings');
+      } else {
+        // Enhance the prompt only if it's not a schema
+        const enhancedPrompt = `
 INSTRUCTIONS:
-${listingPrompt}
+${listingPromptOrSchema}
 
 REQUIREMENTS:
 1. Return valid JSON only.
@@ -79,36 +97,39 @@ REQUIREMENTS:
 
 EXAMPLE OUTPUT (Structure):
 ${JSON.stringify(this.extractionTemplate, null, 2)}
-      `;
+        `;
+        scrapeOptions.listingPrompt = enhancedPrompt;
+        console.log('[DEBUG] Passing enhanced listingPrompt to scrapeListings');
+      }
 
-      // Scrape property listings using the enhanced prompt and headers
-      // Note: scrapeListings needs to accept 'headers' in its options object
-      const listingsData = await this.propertyScraper.scrapeListings({
-        source,
-        url,
-        filters,
-        listingPrompt: enhancedPrompt,
-        headers: this.headers // Pass headers here
-      });
+
+      // Scrape property listings using the determined options
+      const listingsData = await this.propertyScraper.scrapeListings(scrapeOptions);
 
       console.log(`[DEBUG] Extraction result type: ${typeof listingsData}`);
       console.log(`[DEBUG] Extraction result (raw):`, listingsData);
 
-      // Ensure the result has the expected structure (object with 'items' array)
-      let finalData = this.extractionTemplate; // Default to empty template
-      if (listingsData && typeof listingsData === 'object' && Array.isArray(listingsData.items)) {
-          finalData = listingsData;
-          console.log(`[DEBUG] Valid listing data structure received. Items count: ${finalData.items.length}`);
+      // Handle the data structure returned by the Python service
+      let listings = []; // Default to empty array
+      // Check if the data is an array (returned by CSS schema extraction)
+      if (Array.isArray(listingsData)) {
+          listings = listingsData;
+          console.log(`[DEBUG] Received list data structure directly. Items count: ${listings.length}`);
+      // Check if the data is an object with an 'items' array (expected from LLM extraction)
+      } else if (listingsData && typeof listingsData === 'object' && listingsData.items && Array.isArray(listingsData.items)) {
+          listings = listingsData.items;
+          console.log(`[DEBUG] Received object with 'items' array. Items count: ${listings.length}`);
       } else {
-          console.warn(`[DEBUG] Received unexpected data structure or null. Defaulting to empty template. Received:`, listingsData);
+          // Log warning if the structure is neither a list nor an object with 'items'
+          console.warn(`[DEBUG] Received unexpected data structure or null/empty from Python service. Defaulting to empty list. Received:`, listingsData);
       }
-
-      const listings = finalData.items; // Extract the array for processing
+      // listings variable now holds the array of items (or an empty array) for processing
 
       // Initialize results counters
       let processedItems = 0;
       let successItems = 0;
       let failedItems = 0;
+      let skippedItems = 0; // Added counter for skipped duplicates
 
       // Process each listing (if any)
       for (const listing of listings) {
@@ -120,8 +141,35 @@ ${JSON.stringify(this.extractionTemplate, null, 2)}
         }
         try {
           processedItems++;
+
+          // Construct absolute URL if needed (e.g., for bookstoscrape)
+          let detailUrl = listing.url;
+          if (source === 'bookstoscrape-test' && !detailUrl.startsWith('http')) {
+              // Assuming the base URL is known or can be derived/passed
+              const baseUrl = 'http://books.toscrape.com/'; // Define base URL
+              // Avoid double slashes if listing.url starts with /catalogue...
+              detailUrl = new URL(detailUrl.startsWith('/') ? detailUrl.substring(1) : detailUrl, baseUrl).href;
+              console.log(`[DEBUG] Constructed absolute URL for ${source}: ${detailUrl}`);
+          }
+
           // Scrape detailed property data (assuming scrapePropertyDetails exists and works)
-          const propertyDetails = await this.propertyScraper.scrapePropertyDetails(listing.url);
+          const propertyDetails = await this.propertyScraper.scrapePropertyDetails(detailUrl); // Use potentially modified detailUrl
+
+          // --- Check for existing property using listing_url ---
+          try {
+            const checkResult = await pgPool.query('SELECT id FROM properties WHERE listing_url = $1 LIMIT 1', [propertyDetails.scrapedUrl]);
+            if (checkResult.rowCount > 0) {
+              console.log(`[DEBUG] Skipping duplicate property (already exists): ${propertyDetails.scrapedUrl}`);
+              skippedItems++;
+              continue; // Skip to the next listing
+            }
+          } catch (dbCheckError) {
+            console.error(`[DEBUG] Error checking for existing property (${propertyDetails.scrapedUrl}): ${dbCheckError.message}`);
+            failedItems++; // Count as failure if DB check fails
+            continue; // Skip to the next listing
+          }
+          // --- End Check ---
+
           // Save property data (assuming savePropertyData exists and works)
           const savedProperty = await this.propertyScraper.savePropertyData(propertyDetails);
           // Get rental estimate (assuming estimateRental exists and works)
@@ -148,12 +196,13 @@ ${JSON.stringify(this.extractionTemplate, null, 2)}
         totalItems: listings.length, // Count items from the extracted array
         processedItems,
         successItems,
-        failedItems
+        failedItems,
+        skippedItems // Added skipped count
       };
       scrapingJob.endTime = new Date();
       await scrapingJob.save();
 
-      console.log(`Property scraping job completed: ${successItems} successful, ${failedItems} failed out of ${listings.length} potential listings.`);
+      console.log(`Property scraping job completed: ${successItems} successful, ${failedItems} failed, ${skippedItems} skipped out of ${listings.length} potential listings.`);
 
       // Return structure indicating overall job success and the extracted data
       return {
@@ -189,11 +238,12 @@ ${JSON.stringify(this.extractionTemplate, null, 2)}
    * @param {string} source - Source website (e.g., 'zillow', 'apartments')
    * @param {string} url - Base URL to scrape
    * @param {Object} filters - Search filters
+   * @param {string | null} listingPrompt - Optional LLM prompt for listing extraction
    * @returns {Promise<Object>} - Job results
    */
-  async runRentalScrapingJob(source, url, filters = {}) {
+  async runRentalScrapingJob(source, url, filters = {}, listingPrompt = null) { // Added listingPrompt parameter
     console.log(`Starting rental scraping job from ${source}`);
-    
+
     try {
       // Ensure MongoDB is connected for this script execution
       await connectMongoDB(); 
@@ -209,14 +259,50 @@ ${JSON.stringify(this.extractionTemplate, null, 2)}
       });
       
       await scrapingJob.save();
-      
-      // Scrape rental listings
-      const listings = await this.rentalScraper.scrapeRentalListings({ url, filters }); // Pass args as single object
-      
+
+      // Scrape rental listings, passing the prompt if available
+      const scrapeOptions = { url, filters };
+      if (listingPrompt) {
+        // Enhance the prompt similar to property scraping for consistency
+        const enhancedPrompt = `
+INSTRUCTIONS:
+${listingPrompt}
+
+REQUIREMENTS:
+1. Return valid JSON only.
+2. The top-level structure MUST contain an "items" array, even if empty.
+3. Each object within the "items" array must have all the fields requested in the prompt (use null if a value cannot be found).
+4. Ensure no additional text, comments, or markdown formatting surrounds the JSON output.
+
+EXAMPLE OUTPUT (Structure):
+${JSON.stringify(this.extractionTemplate, null, 2)}
+        `;
+        scrapeOptions.listingPrompt = enhancedPrompt;
+        console.log('[DEBUG] Passing enhanced listingPrompt to scrapeRentalListings');
+      } else {
+        // If no specific prompt, the rentalScraper will use its default generic one
+         console.log('[DEBUG] No specific listingPrompt provided, rentalScraper will use default.');
+      }
+      const listingsData = await this.rentalScraper.scrapeRentalListings(scrapeOptions); // Pass scrapeOptions
+
+      // Handle the data structure returned by the Python service (similar to property job)
+      let listings = []; // Default to empty array
+      if (Array.isArray(listingsData)) {
+          listings = listingsData;
+          console.log(`[DEBUG] Received list data structure directly. Items count: ${listings.length}`);
+      } else if (listingsData && typeof listingsData === 'object' && listingsData.items && Array.isArray(listingsData.items)) {
+          listings = listingsData.items;
+          console.log(`[DEBUG] Received object with 'items' array. Items count: ${listings.length}`);
+      } else {
+          console.warn(`[DEBUG] Received unexpected data structure or null/empty from Python service for rentals. Defaulting to empty list. Received:`, listingsData);
+      }
+      // listings variable now holds the array of items (or an empty array)
+
       // Initialize results
       let processedItems = 0;
       let successItems = 0;
       let failedItems = 0;
+      let skippedItems = 0; // Added counter for skipped duplicates
       
       // Process each listing
       for (const listing of listings) {
@@ -225,6 +311,27 @@ ${JSON.stringify(this.extractionTemplate, null, 2)}
           
           // Scrape detailed rental data
           const rentalDetails = await this.rentalScraper.scrapeRentalDetails(listing.url);
+
+          // --- Check for existing rental using address components ---
+          try {
+            const existingRental = await RentalTrainingData.findOne({
+              address: rentalDetails.address,
+              city: rentalDetails.city,
+              state: rentalDetails.state,
+              zip: rentalDetails.zip
+            }).limit(1).lean(); // Use lean for performance
+
+            if (existingRental) {
+              console.log(`[DEBUG] Skipping duplicate rental (already exists): ${rentalDetails.address}, ${rentalDetails.city}`);
+              skippedItems++;
+              continue; // Skip to the next listing
+            }
+          } catch (dbCheckError) {
+            console.error(`[DEBUG] Error checking for existing rental (${rentalDetails.address}): ${dbCheckError.message}`);
+            failedItems++; // Count as failure if DB check fails
+            continue; // Skip to the next listing
+          }
+          // --- End Check ---
           
           // Save rental data to database for training
           await this.rentalScraper.saveRentalData(rentalDetails);
@@ -242,13 +349,14 @@ ${JSON.stringify(this.extractionTemplate, null, 2)}
         totalItems: listings.length,
         processedItems,
         successItems,
-        failedItems
+        failedItems,
+        skippedItems // Added skipped count
       };
       scrapingJob.endTime = new Date();
       
       await scrapingJob.save();
       
-      console.log(`Rental scraping job completed: ${successItems} successful, ${failedItems} failed`);
+      console.log(`Rental scraping job completed: ${successItems} successful, ${failedItems} failed, ${skippedItems} skipped out of ${listings.length} potential listings.`);
       
       return {
         jobId: scrapingJob._id,

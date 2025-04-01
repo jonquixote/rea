@@ -58,8 +58,7 @@ const PropertySchema = new Schema({
   timestamps: true
 });
 
-// Create indexes
-PropertySchema.index({ pgPropertyId: 1 });
+// Create indexes (Removed duplicate pgPropertyId index)
 PropertySchema.index({ 'metadata.source': 1 });
 PropertySchema.index({ 'metadata.scrapedAt': 1 });
 

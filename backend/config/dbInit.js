@@ -27,11 +27,11 @@ const pgPool = new Pool({
 // MongoDB connection
 const mongoURI = process.env.MONGO_URI || 'mongodb://localhost:27017/real-estate-app';
 
-// Initialize PostgreSQL schema
-const initPostgresSchema = async () => {
-  const client = await pgPool.connect();
+// Initialize PostgreSQL schema using a provided client
+const initPostgresSchema = async (client) => {
+  // Removed client creation, as it's passed in
   try {
-    console.log('Initializing PostgreSQL schema...');
+    console.log('Initializing PostgreSQL schema using provided client...');
     
     // Initialize PostGIS extension
     console.log('Initializing PostGIS extension...');
@@ -61,9 +61,7 @@ const initPostgresSchema = async () => {
   } catch (error) {
     console.error('Error initializing PostgreSQL schema:', error);
     throw error;
-  } finally {
-    client.release();
-  }
+  } // Removed finally block, client release handled in db.js
 };
 
 // Initialize MongoDB connection
@@ -83,16 +81,19 @@ const initMongoDB = async () => {
 
 // Main initialization function
 const initDatabase = async () => {
+  // This main initDatabase function is now primarily for standalone execution
+  // We'll use the exported initPostgresSchema directly in db.js
+  const client = await pgPool.connect(); // Need a client for standalone execution
   try {
-    await initPostgresSchema();
+    await initPostgresSchema(client); // Pass the client
     await initMongoDB();
     console.log('Database initialization completed successfully');
   } catch (error) {
     console.error('Database initialization failed:', error);
     process.exit(1);
   } finally {
-    // Close connections
-    pgPool.end();
+    if (client) client.release(); // Release client used for standalone execution
+    pgPool.end(); // End the pool used for standalone execution
     mongoose.connection.close();
   }
 };
@@ -102,4 +103,5 @@ if (require.main === module) {
   initDatabase();
 }
 
-module.exports = { initDatabase, pgPool };
+// Export initPostgresSchema for use in db.js
+module.exports = { initDatabase, initPostgresSchema, pgPool };
